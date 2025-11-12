@@ -345,11 +345,11 @@ class Simulator(tk.Tk):
         self.steering_perturbation_range = 8  # 转向扰动范围(度)
 
         # 位移扰动
-        self.position_perturbation_enabled = False  # 是否启用位移扰动
+        self.position_perturbation_enabled = True  # 是否启用位移扰动
         self.position_perturbation_prob = 0.02  # 扰动发生概率 (10%)
         self.position_perturbation_counter = 0  # 扰动计数器
-        self.position_perturbation_interval = 20  # 扰动最小间隔(更新次数)
-        self.position_perturbation_range = 15  # 位移扰动范围(像素)
+        self.position_perturbation_interval = 50  # 扰动最小间隔(更新次数)
+        self.position_perturbation_range = 6  # 位移扰动范围(像素)
 
         self.in_map_edit = False
         self.in_keyboard_control = False
