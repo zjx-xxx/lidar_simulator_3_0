@@ -409,8 +409,6 @@ class Simulator(tk.Tk):
         self.passed_points = []  # 已跟随的点（绿色）
         self.current_follow_point = None  # 当前跟随的前视点（红色）
         self.steering_pid = PID(Kp=6.0, Ki=0.1, Kd=0.2, output_limit=50, map=1)
-        self.polyline_segments = []  # 历史折线段
-        self.current_segment = []  # 当前未收尾的折线段
 
     def log(self, message):
         self.log_text.config(state=tk.NORMAL)
@@ -518,23 +516,6 @@ class Simulator(tk.Tk):
         self.grid = np.load(resource_path("data/map_default.npy"))
         self.draw_map()
         self.log("加载默认地图")
-
-        # 清空路径容器（蓝色历史段、当前段、已完成段/跟随轨迹）
-        self.polyline_segments = []  # 历史折线段
-        self.current_segment = []  # 当前未收尾的折线段
-        if hasattr(self, "completed_polyline_segments"):
-            self.completed_polyline_segments.clear()  # 若你用绿色标记已完成段
-        if hasattr(self, "followed_path_points"):
-            self.followed_path_points.clear()  # 已走过的轨迹点（若用于可视化）
-
-        # 清空用于循迹的采样路径与状态
-        self.path_pts = None
-        self.path_s = None
-        self.polyline_index = 0
-        self.current_target_point = None
-
-        # 触发重绘（只画地图和车，不再画折线）
-        self.redraw_polyline()
         if self.car is not None:
             self.simulation_canvas.delete(self.car)
             self.car = None
@@ -1485,6 +1466,23 @@ class Simulator(tk.Tk):
         self.car_control_value[:, 0] = 0
         self.polyline_record_end = self.dataindex
         self.log(f"折线循迹结束，记录数据索引：{self.polyline_record_start} 到 {self.polyline_record_end}")
+
+        # 清空路径容器（蓝色历史段、当前段、已完成段/跟随轨迹）
+        self.polyline_segments.clear()  # 历史折线段
+        self.current_segment = []  # 当前未收尾的折线段
+        if hasattr(self, "completed_polyline_segments"):
+            self.completed_polyline_segments.clear()  # 若你用绿色标记已完成段
+        if hasattr(self, "followed_path_points"):
+            self.followed_path_points.clear()  # 已走过的轨迹点（若用于可视化）
+
+        # 清空用于循迹的采样路径与状态
+        self.path_pts = None
+        self.path_s = None
+        self.polyline_index = 0
+        self.current_target_point = None
+
+        # 触发重绘（只画地图和车，不再画折线）
+        self.redraw_polyline()
 
     def follow_polyline(self):
         if not self.polyline_following:
