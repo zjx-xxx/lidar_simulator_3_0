@@ -408,7 +408,7 @@ class Simulator(tk.Tk):
 
         self.passed_points = []  # 已跟随的点（绿色）
         self.current_follow_point = None  # 当前跟随的前视点（红色）
-        self.steering_pid = PID(Kp=6.0, Ki=0.1, Kd=0.2, output_limit=50, map=1)
+        self.steering_pid = PID(Kp=5.0, Ki=0.05, Kd=0.25, output_limit=50, map=1)
 
     def log(self, message):
         self.log_text.config(state=tk.NORMAL)

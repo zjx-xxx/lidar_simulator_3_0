@@ -87,7 +87,7 @@ if all_data:
     merged_data.to_csv('./Data.csv', header=False, index=False)
 
     # 先整体打乱
-    merged_data = merged_data.sample(frac=1, random_state=42).reset_index(drop=True)
+    merged_data = merged_data.sample(frac=1).reset_index(drop=True)
 
     # 划分训练集和测试集（10%测试）
     test_size = 0.1
