@@ -338,14 +338,14 @@ class Simulator(tk.Tk):
         # 新增扰动参数
 
         # 转向扰动
-        self.steering_perturbation_enabled = True  # 是否启用转向扰动
+        self.steering_perturbation_enabled = False  # 是否启用转向扰动
         self.steering_perturbation_prob = 0.02  # 扰动发生概率 (20%)
         self.steering_perturbation_counter = 0  # 扰动计数器
         self.steering_perturbation_interval = 10  # 扰动最小间隔(更新次数)
         self.steering_perturbation_range = 8  # 转向扰动范围(度)
 
         # 位移扰动
-        self.position_perturbation_enabled = True  # 是否启用位移扰动
+        self.position_perturbation_enabled = False  # 是否启用位移扰动
         self.position_perturbation_prob = 0.02  # 扰动发生概率 (10%)
         self.position_perturbation_counter = 0  # 扰动计数器
         self.position_perturbation_interval = 20  # 扰动最小间隔(更新次数)
@@ -408,7 +408,9 @@ class Simulator(tk.Tk):
 
         self.passed_points = []  # 已跟随的点（绿色）
         self.current_follow_point = None  # 当前跟随的前视点（红色）
-        self.steering_pid = PID(Kp=14.0, Ki=0.1, Kd=0.2, output_limit=50, map=1)
+        self.steering_pid = PID(Kp=6.0, Ki=0.1, Kd=0.2, output_limit=50, map=1)
+        self.polyline_segments = []  # 历史折线段
+        self.current_segment = []  # 当前未收尾的折线段
 
     def log(self, message):
         self.log_text.config(state=tk.NORMAL)
@@ -516,6 +518,23 @@ class Simulator(tk.Tk):
         self.grid = np.load(resource_path("data/map_default.npy"))
         self.draw_map()
         self.log("加载默认地图")
+
+        # 清空路径容器（蓝色历史段、当前段、已完成段/跟随轨迹）
+        self.polyline_segments = []  # 历史折线段
+        self.current_segment = []  # 当前未收尾的折线段
+        if hasattr(self, "completed_polyline_segments"):
+            self.completed_polyline_segments.clear()  # 若你用绿色标记已完成段
+        if hasattr(self, "followed_path_points"):
+            self.followed_path_points.clear()  # 已走过的轨迹点（若用于可视化）
+
+        # 清空用于循迹的采样路径与状态
+        self.path_pts = None
+        self.path_s = None
+        self.polyline_index = 0
+        self.current_target_point = None
+
+        # 触发重绘（只画地图和车，不再画折线）
+        self.redraw_polyline()
         if self.car is not None:
             self.simulation_canvas.delete(self.car)
             self.car = None
@@ -910,12 +929,13 @@ class Simulator(tk.Tk):
                 pd.Series([slope_value], name="slope")
             ], ignore_index=True)
             # 生成文件路径
-            file_path = f'./mydata/raw/data{self.dataindex}.csv'
-            while os.path.exists(file_path):
+            file_path = './mydata/raw'
+            while os.path.exists(file_path+f'/data{self.dataindex}.csv'):
                 self.dataindex += 1
-                file_path = f'./mydata/raw/data{self.dataindex}.csv'
             # 保存为一列（或一行）
-            combined.to_csv(file_path, index=False, header=False)
+            if file_path and not os.path.exists(file_path):
+                os.makedirs(file_path)
+            combined.to_csv(file_path + f'/data{self.dataindex}.csv', index=False, header=False)
             # 更新索引记录
             self.dataindex += 1
             with open('index.txt', 'w') as f:
@@ -1154,7 +1174,7 @@ class Simulator(tk.Tk):
                 tA, tB = 3 * math.pi / 2, math.pi
             elif dir_enter == 'W' and dir_exit == 'N':
                 cx, cy = x0, y0 - b
-                tA, tB = 0.0, math.pi / 2
+                tA, tB = math.pi / 2, math.pi
             elif dir_enter == 'N' and dir_exit == 'E':
                 cx, cy = x0 + a, y0
                 tA, tB = math.pi, 3 * math.pi / 2
@@ -1382,7 +1402,7 @@ class Simulator(tk.Tk):
         return float(target_x), float(target_y)
 
     def toggle_polyline_following(self):
-        if self.polyline_following == False:
+        if not self.polyline_following:
             self.start_polyline_following()
         else:
             self.close_polyline_following()
