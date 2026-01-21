@@ -808,7 +808,7 @@ class Simulator(tk.Tk):
             if self.road == 0:
                 self.towards = 0
             else:
-                self.towards = 1
+                self.towards = 2
             x_lidar = torch.tensor([second_column_as_row], dtype=torch.float32, device=device)  # [1, 360]
             road_type = torch.tensor([self.road], dtype=torch.long, device=device)  # [1]
             turn_direction = torch.tensor([self.towards], dtype=torch.long, device=device)  # [1]

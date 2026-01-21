@@ -349,7 +349,7 @@ class Simulator(tk.Tk):
         self.position_perturbation_prob = 0.02  # 扰动发生概率 (10%)
         self.position_perturbation_counter = 0  # 扰动计数器
         self.position_perturbation_interval = 50  # 扰动最小间隔(更新次数)
-        self.position_perturbation_range = 6  # 位移扰动范围(像素)
+        self.position_perturbation_range = 8  # 位移扰动范围(像素)
 
         self.in_map_edit = False
         self.in_keyboard_control = False
@@ -408,7 +408,7 @@ class Simulator(tk.Tk):
 
         self.passed_points = []  # 已跟随的点（绿色）
         self.current_follow_point = None  # 当前跟随的前视点（红色）
-        self.steering_pid = PID(Kp=5.0, Ki=0.05, Kd=0.25, output_limit=50, map=1)
+        self.steering_pid = PID(Kp=5.0, Ki=0, Kd=0, output_limit=30, map=1)
 
     def log(self, message):
         self.log_text.config(state=tk.NORMAL)

@@ -3,4 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="pytorch" />
   </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="C:\Users\26762\miniforge3\envs\ai" project-jdk-type="Python SDK" />
 </project>

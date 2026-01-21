@@ -2,8 +2,7 @@
 # train_reg.py
 # 适配新版 RegressionNetwork（Conv1d + FiLM + 门控），单输出角度（度）
 # 损失：环形误差 + Huber（Smooth L1）
-# 评估：MAE/Hit@3° 使用环形误差
-# 使用方式：与原脚本基本一致
+# 评估：MAE/Hit@5° 使用环形误差
 # =========================================================
 
 import os
@@ -16,25 +15,28 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from model_reg import RegressionNetwork  # 你提供的新版
+import time
+import random
+
+from models.model_reg import RegressionNetwork  # 你提供的新版
 
 # =========================
 # 设备与随机种子
 # =========================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-def set_seed(seed=42):
-    import random
+def set_seed(seed=None):
+    if seed is None:
+        seed = int(time.time())   # 当前时间（秒）
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    return seed
 
-
-set_seed(2025)
+seed = set_seed()
 
 
 # =========================
@@ -111,11 +113,11 @@ class LidarRegressionDataset(Dataset):
 
 
 # =========================
-# 评估函数（环形 MAE / Hit@3°）
+# 评估函数（环形 MAE / Hit@5°）
 # =========================
 @torch.no_grad()
 def evaluate(model, dataloader, base_weight=1.0, angle_weight=10.0,
-             hit_threshold_deg=3.0, delta=5.0):
+             hit_threshold_deg=5.0, delta=5.0):
     model.eval()
     total_loss, total_mae, total_hit, total_samples = 0.0, 0.0, 0.0, 0
 
@@ -125,17 +127,14 @@ def evaluate(model, dataloader, base_weight=1.0, angle_weight=10.0,
         turn_direction = turn_direction.to(device)
         target = target.to(device)
 
-        outputs = model(x_lidar, road_type, turn_direction)  # [B]（你的模型里 squeeze 掉了）
+        outputs = model(x_lidar, road_type, turn_direction)  # [B]
         loss = wrapped_huber_angle_loss(outputs, target,
                                         base_weight=base_weight,
                                         angle_weight=angle_weight,
                                         delta=delta)
 
         # 环形误差 -> MAE / Hit
-        if target.ndim > 1:
-            target_flat = target.view(-1)
-        else:
-            target_flat = target
+        target_flat = target.view(-1) if target.ndim > 1 else target
         err = torch.abs(ang_wrap_deg(outputs - target_flat))
         mae = torch.sum(err).item()
         hit = torch.sum((err < hit_threshold_deg).float()).item()
@@ -152,13 +151,79 @@ def evaluate(model, dataloader, base_weight=1.0, angle_weight=10.0,
     return avg_loss, avg_mae, hit_rate
 
 
+@torch.no_grad()
+def export_hit5_csv(model, dataset,
+                    csv_pass_path='./mydata/hit5_pass_val.csv',
+                    csv_fail_path='./mydata/hit5_fail_val.csv',
+                    hit_threshold_deg=5.0,
+                    use_embedding=True):
+    """
+    将 dataset 中样本按 Hit@5° 分类并导出为 364 列 CSV：
+      [360 LiDAR] + [1 road_type] + [1 turn_direction] + [1 y_true] + [1 y_pred]
+    """
+    model.eval()
+    loader = DataLoader(dataset, batch_size=4096, shuffle=False)
+
+    rows_pass = []
+    rows_fail = []
+
+    for x_lidar, road_type, turn_direction, target in loader:
+        # === 前向预测 ============================================
+        x_lidar_dev = x_lidar.to(device)
+        road_dev = road_type.to(device)
+        turn_dev = turn_direction.to(device)
+        target_dev = target.to(device)
+
+        outputs = model(x_lidar_dev, road_dev, turn_dev)  # [B]
+        outputs = outputs.view(-1) if outputs.ndim > 1 else outputs
+        target_flat = target_dev.view(-1) if target_dev.ndim > 1 else target_dev
+
+        # === 计算角度误差 & Hit5 ================================
+        err = torch.abs(ang_wrap_deg(outputs - target_flat))
+        hit_mask = (err < hit_threshold_deg).cpu().numpy()
+        miss_mask = ~hit_mask
+
+        # === 转 numpy ===========================================
+        x_np = x_lidar.cpu().numpy()                          # [B,360]
+        road_np = road_type.cpu().numpy().reshape(-1, 1)      # [B,1]
+        turn_np = turn_direction.cpu().numpy().reshape(-1, 1) # [B,1]
+        y_true_np = target.cpu().numpy().reshape(-1, 1)       # [B,1]
+        y_pred_np = outputs.cpu().numpy().reshape(-1, 1)      # [B,1]
+
+        # === 拼 364 列：362 输入 + y_true + y_pred = 364 =========
+        full_np = np.concatenate(
+            [x_np, road_np, turn_np, y_true_np, y_pred_np],
+            axis=1
+        )
+
+        # === 归类保存 ===========================================
+        if hit_mask.any():
+            rows_pass.append(full_np[hit_mask])
+        if miss_mask.any():
+            rows_fail.append(full_np[miss_mask])
+
+    # === 输出 CSV ===============================================
+    os.makedirs(os.path.dirname(csv_pass_path), exist_ok=True)
+
+    if len(rows_pass) > 0:
+        arr_pass = np.concatenate(rows_pass, axis=0)
+        np.savetxt(csv_pass_path, arr_pass, delimiter=',')
+        print(f"✅ Hit@5° 通过样本 CSV 已生成 {csv_pass_path}, shape = {arr_pass.shape}")
+
+    if len(rows_fail) > 0:
+        arr_fail = np.concatenate(rows_fail, axis=0)
+        np.savetxt(csv_fail_path, arr_fail, delimiter=',')
+        print(f"❌ Hit@5° 不通过样本 CSV 已生成 {csv_fail_path}, shape = {arr_fail.shape}")
+
+
 # =========================
 # 训练主循环（接口保持不变）
 # =========================
 def train(model, train_data, val_data,
           num_epochs=1000, batch_size=64, learning_rate=1e-3,
           early_stop_patience=50,
-          base_weight=1.0, angle_weight=10.0, delta=5.0):
+          base_weight=1.0, angle_weight=10.0, delta=5.0,
+          hit_threshold_deg=5.0):
     train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False)
 
@@ -167,7 +232,7 @@ def train(model, train_data, val_data,
         optimizer, mode='min', factor=0.5, patience=10
     )
 
-    history = {"train_loss": [], "val_loss": [], "val_mae": [], "val_hit3": [], "lr": []}
+    history = {"train_loss": [], "val_loss": [], "val_mae": [], "val_hit5": [], "lr": []}
 
     best_val_loss = float('inf')
     best_state = None
@@ -200,10 +265,10 @@ def train(model, train_data, val_data,
         train_loss = running_loss / max(seen, 1)
 
         # 验证
-        val_loss, val_mae, val_hit3 = evaluate(
+        val_loss, val_mae, val_hit5 = evaluate(
             model, val_loader,
             base_weight=base_weight, angle_weight=angle_weight,
-            hit_threshold_deg=3.0, delta=delta
+            hit_threshold_deg=hit_threshold_deg, delta=delta
         )
 
         scheduler.step(val_loss)
@@ -212,12 +277,12 @@ def train(model, train_data, val_data,
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
         history["val_mae"].append(val_mae)
-        history["val_hit3"].append(val_hit3)
+        history["val_hit5"].append(val_hit5)
         history["lr"].append(optimizer.param_groups[0]['lr'])
 
         print(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | "
               f"Val Loss: {val_loss:.4f} | Val MAE(deg): {val_mae:.3f} | "
-              f"Hit@3°: {val_hit3 * 100:.1f}% | LR: {optimizer.param_groups[0]['lr']:.2e}")
+              f"Hit@5°: {val_hit5 * 100:.1f}% | LR: {optimizer.param_groups[0]['lr']:.2e}")
 
         # Early Stopping
         if val_loss < best_val_loss - 1e-4:
@@ -244,7 +309,7 @@ def train(model, train_data, val_data,
 
 
 # =========================
-# 画训练曲线（沿用）
+# 画训练曲线
 # =========================
 def plot_history(history, out_path='./model/training_curves.png'):
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -254,49 +319,49 @@ def plot_history(history, out_path='./model/training_curves.png'):
     plt.figure()
     plt.plot(epochs, history["train_loss"], label='Train Loss')
     plt.plot(epochs, history["val_loss"], label='Val Loss')
-    plt.xlabel('Epoch');
-    plt.ylabel('Loss');
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
     plt.title('Loss vs. Epoch')
-    plt.legend();
-    plt.grid(True);
+    plt.legend()
+    plt.grid(True)
     plt.tight_layout()
-    plt.savefig(out_path.replace('.png', '_loss.png'));
+    plt.savefig(out_path.replace('.png', '_loss.png'))
     plt.close()
 
     # MAE
     plt.figure()
     plt.plot(epochs, history["val_mae"], label='Val MAE (deg)')
-    plt.xlabel('Epoch');
-    plt.ylabel('MAE (deg)');
+    plt.xlabel('Epoch')
+    plt.ylabel('MAE (deg)')
     plt.title('Validation MAE vs. Epoch')
-    plt.legend();
-    plt.grid(True);
+    plt.legend()
+    plt.grid(True)
     plt.tight_layout()
-    plt.savefig(out_path.replace('.png', '_mae.png'));
+    plt.savefig(out_path.replace('.png', '_mae.png'))
     plt.close()
 
-    # Hit@3°
+    # Hit@5°
     plt.figure()
-    plt.plot(epochs, history["val_hit3"], label='Hit@3°')
-    plt.xlabel('Epoch');
-    plt.ylabel('Hit Rate');
-    plt.title('Hit@3° vs. Epoch')
-    plt.legend();
-    plt.grid(True);
+    plt.plot(epochs, history["val_hit5"], label='Hit@5°')
+    plt.xlabel('Epoch')
+    plt.ylabel('Hit Rate')
+    plt.title('Hit@5° vs. Epoch')
+    plt.legend()
+    plt.grid(True)
     plt.tight_layout()
-    plt.savefig(out_path.replace('.png', '_hit3.png'));
+    plt.savefig(out_path.replace('.png', '_hit5.png'))
     plt.close()
 
     # Learning Rate
     plt.figure()
     plt.plot(epochs, history["lr"], label='Learning Rate')
-    plt.xlabel('Epoch');
-    plt.ylabel('LR');
+    plt.xlabel('Epoch')
+    plt.ylabel('LR')
     plt.title('Learning Rate vs. Epoch')
-    plt.legend();
-    plt.grid(True);
+    plt.legend()
+    plt.grid(True)
     plt.tight_layout()
-    plt.savefig(out_path.replace('.png', '_lr.png'));
+    plt.savefig(out_path.replace('.png', '_lr.png'))
     plt.close()
 
 
@@ -316,9 +381,12 @@ def load_split(prefix):
     turn_direction = pd.read_csv(f'./mydata/towards/Y_{prefix}.csv', header=None).values
     y = pd.read_csv(f'./mydata/direction/Y_{prefix}.csv', header=None).values.astype(np.float32)
 
-    if road_type.ndim == 1: road_type = road_type.reshape(-1, 1)
-    if turn_direction.ndim == 1: turn_direction = turn_direction.reshape(-1, 1)
-    if y.ndim == 1: y = y.reshape(-1, 1)
+    if road_type.ndim == 1:
+        road_type = road_type.reshape(-1, 1)
+    if turn_direction.ndim == 1:
+        turn_direction = turn_direction.reshape(-1, 1)
+    if y.ndim == 1:
+        y = y.reshape(-1, 1)
 
     # 统一标签到 [-180,180)
     y = ((y + 180.0) % 360.0) - 180.0
@@ -336,8 +404,6 @@ def _extract_y(sample):
         if 'y' in sample:
             y = sample['y']
         else:
-            # 取最后一个键的值
-            # 注意：Python 3.7+ 字典有插入序
             y = list(sample.values())[-1]
     elif isinstance(sample, (tuple, list)):
         y = sample[-1]
@@ -347,7 +413,6 @@ def _extract_y(sample):
     if isinstance(y, torch.Tensor):
         return y.detach().float().reshape(-1)
     else:
-        # 可能是 numpy / 标量
         return torch.as_tensor(y, dtype=torch.float32).reshape(-1)
 
 
@@ -355,13 +420,11 @@ def collect_y_tensor(dataset, batch_size=4096, num_workers=0):
     """
     高效收集整个 dataset 的 y 到一个 1D Tensor。
     不用逐条 __getitem__，而是用 DataLoader 批处理。
-    注意：collate_fn 默认即可；我们只从 batch 中抽 y。
     """
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers, pin_memory=False)
     ys = []
     for batch in loader:
-        # batch 可能是 tuple/list/dict，与单条一致
         ys.append(_extract_y(batch))
     return torch.cat(ys, dim=0)
 
@@ -380,7 +443,6 @@ def describe_tensor_1d(name, ys: torch.Tensor, bins=10):
     print(f"Min:   {ys.min().item():.6f}")
     print(f"Max:   {ys.max().item():.6f}")
     print(f"Mean:  {ys.mean().item():.6f}")
-    # unbiased=False -> 与 numpy.std(ddof=0) 一致
     print(f"Std:   {ys.std(unbiased=False).item():.6f}")
     print(f"25/50/75% quantiles: [{qv[0]:.6f}, {qv[1]:.6f}, {qv[2]:.6f}]")
     print(f"Histogram ({bins} bins): {h}")
@@ -392,7 +454,7 @@ def describe_dataset(name, dataset, bins=10, batch_size=4096, num_workers=0):
 
 
 # =========================
-# 主入口（与原版相同风格）
+# 主入口
 # =========================
 if __name__ == '__main__':
     X_train, road_train, turn_train, y_train = load_split('train')
@@ -407,38 +469,49 @@ if __name__ == '__main__':
     train_dataset = LidarRegressionDataset(X_train, road_train, turn_train, y_train, use_embedding=USE_EMB)
     val_dataset = LidarRegressionDataset(X_val, road_val, turn_val, y_val, use_embedding=USE_EMB)
 
-    print(f"Train shapes: {X_train.shape} {y_train.shape} ...")  # 你已有
-    print(f"Val   shapes: {X_val.shape} {y_val.shape} ...")
-
-    # 统计 y（自动适配 (x, y) / (x, a, b, y) / dict）
     describe_dataset("Train", train_dataset, bins=10, batch_size=4096, num_workers=0)
     describe_dataset("Val", val_dataset, bins=10, batch_size=4096, num_workers=0)
 
     # 与你 model_reg.py 的默认参数保持一致（n_road / n_turn 请按你的真实类别数改）
     model = RegressionNetwork(
         use_embedding=USE_EMB,
-        n_road=10,  # ★ 按实际类别数调整
-        n_turn=5,  # ★ 按实际类别数调整
-        # 其余超参保持默认即可
+        n_road=4,  # ★ 按实际类别数调整
+        n_turn=3,  # ★ 按实际类别数调整
+        aux_tail=2,
+        aux_dropout_p=0.1,
+        aux_scale=0.2,
     ).to(device)
 
-    history = train(model, train_dataset, val_dataset,
-                    num_epochs=1000,
-                    batch_size=64,
-                    learning_rate=1e-3,
-                    early_stop_patience=100,
-                    base_weight=1.0,
-                    angle_weight=10.0,
-                    delta=5.0)
+    history = train(
+        model, train_dataset, val_dataset,
+        num_epochs=400,
+        batch_size=32,
+        learning_rate=1e-3,
+        early_stop_patience=25,
+        base_weight=1.0,
+        angle_weight=5.0,
+        delta=1.5,
+        hit_threshold_deg=5.0,   # ★ Hit@5°
+    )
 
     plot_history(history, out_path='./model/training_curves.png')
     print('📈 Curves saved to ./model/training_curves_*')
 
-    # # 可选：推理示例
-    # with torch.no_grad():
-    #     x_lidar, road, turn, gt = val_dataset[0]
-    #     pred_deg = model(x_lidar.unsqueeze(0).to(device),
-    #                      road.unsqueeze(0).to(device),
-    #                      turn.unsqueeze(0).to(device))
-    #     pred_deg = RegressionNetwork.vec2angle_deg(pred_deg)  # 规范到 [-180,180)
-    #     print("Pred angle (deg):", float(pred_deg.cpu()))
+    # 训练结束后，用最优模型在验证集上导出 Hit@5° 通过/不通过样本
+    export_hit5_csv(
+        model,
+        val_dataset,
+        csv_pass_path='./mydata/hit5_pass_val.csv',
+        csv_fail_path='./mydata/hit5_fail_val.csv',
+        hit_threshold_deg=5.0,
+        use_embedding=USE_EMB
+    )
+
+    export_hit5_csv(
+        model,
+        train_dataset,
+        csv_pass_path='./mydata/hit5_pass_train.csv',
+        csv_fail_path='./mydata/hit5_fail_train.csv',
+        hit_threshold_deg=5.0,
+        use_embedding=USE_EMB
+    )

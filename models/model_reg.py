@@ -2,11 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ----------- 小组件 -----------
+# ---------------- Small modules ----------------
 
 class SEModule(nn.Module):
-    """Squeeze-and-Excitation for 1D features: [B,C,L]"""
-    def __init__(self, channels, reduction=8):
+    """Squeeze-and-Excitation for 1D features: [B, C, L]"""
+    def __init__(self, channels: int, reduction: int = 8):
         super().__init__()
         hidden = max(4, channels // reduction)
         self.pool = nn.AdaptiveAvgPool1d(1)
@@ -16,143 +16,249 @@ class SEModule(nn.Module):
             nn.Linear(hidden, channels),
             nn.Sigmoid()
         )
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, L]
-        w = self.pool(x).squeeze(-1)         # [B,C]
-        w = self.fc(w).unsqueeze(-1)         # [B,C,1]
+        w = self.pool(x).squeeze(-1)      # [B, C]
+        w = self.fc(w).unsqueeze(-1)      # [B, C, 1]
         return x * w
+
+
+def make_norm_1d(channels: int, norm: str = "group", gn_max_groups: int = 8) -> nn.Module:
+    """
+    Recommended normalization for small/medium batch sizes:
+    - GroupNorm with an adaptive group count.
+    """
+    if norm == "batch":
+        return nn.BatchNorm1d(channels)
+
+    # group norm
+    g = min(gn_max_groups, channels)
+    while g > 1 and (channels % g != 0):
+        g -= 1
+    return nn.GroupNorm(g, channels)
+
 
 class ResidualConvBlock(nn.Module):
     """
-    残差卷积块（环形 padding），支持 dilation / SE / 可选归一化
-    in/out 通道一致，便于堆叠
+    Residual Conv1D block with circular padding.
+    Two conv layers, each supports dilation. Optional SE.
+    in/out channels are the same.
     """
-    def __init__(self, channels, kernel_size=5, dilation=1,
-                 dropout=0.2, use_se=True, norm='group'):
+    def __init__(
+        self,
+        channels: int,
+        k1: int = 7,
+        k2: int = 3,
+        dilation: int = 1,
+        dropout: float = 0.2,
+        use_se: bool = True,
+        norm: str = "group",
+    ):
         super().__init__()
-        k1 = 3
-        p1 = (k1 // 2) * dilation               # 保持长度
-        k2 = 5
-        p2 = (k2 // 2) * dilation
-        Norm = (lambda c: nn.GroupNorm(8, c)) if norm == 'group' else nn.BatchNorm1d
+        assert k1 % 2 == 1 and k2 % 2 == 1, "Use odd kernel sizes to keep symmetric padding."
 
-        self.conv1 = nn.Conv1d(channels, channels, k1,
-                               padding=p1, dilation=dilation,
-                               padding_mode='circular')
-        self.norm1 = Norm(channels)
+        p1 = ((k1 - 1) // 2) * dilation
+        p2 = ((k2 - 1) // 2) * dilation
+
+        self.conv1 = nn.Conv1d(
+            channels, channels, kernel_size=k1,
+            padding=p1, dilation=dilation, padding_mode="circular"
+        )
+        self.norm1 = make_norm_1d(channels, norm=norm)
         self.act1  = nn.GELU()
         self.drop1 = nn.Dropout(dropout)
 
-        self.conv2 = nn.Conv1d(channels, channels, k2,
-                               padding=p2, dilation=dilation,
-                               padding_mode='circular')
-        self.norm2 = Norm(channels)
-        self.act2  = nn.GELU()
-        self.drop2 = nn.Dropout(dropout)
+        self.conv2 = nn.Conv1d(
+            channels, channels, kernel_size=k2,
+            padding=p2, dilation=dilation, padding_mode="circular"
+        )
+        self.norm2 = make_norm_1d(channels, norm=norm)
 
         self.use_se = use_se
         if use_se:
             self.se = SEModule(channels, reduction=8)
 
-    def forward(self, x):
+        self.act2  = nn.GELU()
+        self.drop2 = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
-        x = self.conv1(x); x = self.norm1(x); x = self.act1(x); x = self.drop1(x)
-        x = self.conv2(x); x = self.norm2(x)
+        y = self.conv1(x)
+        y = self.norm1(y)
+        y = self.act1(y)
+        y = self.drop1(y)
+
+        y = self.conv2(y)
+        y = self.norm2(y)
+
         if self.use_se:
-            x = self.se(x)
-        x = self.act2(x); x = self.drop2(x)
-        return x + residual
+            y = self.se(y)
+
+        y = self.act2(y)
+        y = self.drop2(y)
+        return y + residual
+
 
 class ResidualMLP(nn.Module):
-    """用于回归头的残差 MLP，稳定加深"""
-    def __init__(self, dim, hidden=64, dropout=0.2):
+    """Residual MLP block for the regression head."""
+    def __init__(self, dim: int, hidden: int = 128, dropout: float = 0.2):
         super().__init__()
         self.fc1 = nn.Linear(dim, hidden)
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
         self.fc2 = nn.Linear(hidden, dim)
-    def forward(self, x):
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.fc1(x)
         y = self.act(y)
         y = self.drop(y)
         y = self.fc2(y)
         return x + y
 
-# ----------- 主网络（加深版） -----------
+
+# ---------------- Main network ----------------
 
 class RegressionNetwork(nn.Module):
     """
-    深化版：多层残差Conv1d（环形） + FiLM + 门控 + 残差MLP回归头
-    接口与原先保持一致
+    Recommended version:
+    - Stem conv uses k=7 (circular) for radar consistency
+    - Default stem_pool=False (easier to control RF in degrees)
+    - Residual blocks use (k1=7, k2=3) with dilation schedule
+    - Radar-aware gate: gate([cond, lidar_feat])
+    - FiLM identity init: gamma = 1 + Linear(cond), beta = Linear(cond) init to 0
+    - aux_tail branch: dropout (train only) + aux_scale limiter
     """
+
     def __init__(
         self,
         use_embedding: bool = True,
-        n_road: int = 10,
-        n_turn: int = 5,
-        d_road: int = 8,
+        n_road: int = 4,
+        n_turn: int = 3,
+        d_road: int = 4,
         d_turn: int = 4,
         base_channels: int = 32,
-        num_blocks: int = 8,                  # ★ 控制深度
-        dilation_schedule = (1,2,4,1,2,4),    # ★ 多尺度
-        kernel_size: int = 5,
-        stem_pool: bool = True,               # 首层是否下采样
-        norm: str = 'group',                  # 'group' 或 'batch'
+
+        # blocks / receptive field control
+        num_blocks: int = 5,
+        dilation_schedule=(1, 2, 4, 8, 6),
+        block_k1: int = 7,
+        block_k2: int = 3,
+
+        # stem
+        stem_k: int = 7,
+        stem_pool: bool = False,  # recommended: False for RF control
+
+        # regularization / norm
+        norm: str = "group",
         dropout: float = 0.2,
         use_se: bool = True,
+
+        # fusion / head
         out_dim: int = 1,
+        gate_hidden: int = 64,
+        gate_dropout: float = 0.1,
+        film_identity: bool = True,
+
+        # aux tail features (NOT road/turn)
+        aux_tail: int = 2,          # number of extra continuous features appended to the end of x_lidar
+        aux_dropout_p: float = 0.1, # dropout prob applied to aux_tail (train only)
+        aux_scale: float = 0.2,     # max contribution strength from aux branch
+        print_dilations: bool = False,  # set True if you want to confirm runtime dilations
     ):
         super().__init__()
         self.use_embedding = use_embedding
+        self.film_identity = film_identity
+        self.aux_tail = aux_tail
+        self.aux_scale = aux_scale
+        self.print_dilations = print_dilations
+
         C = base_channels
-        k = kernel_size
-        p = k // 2
 
         # ----- Stem -----
+        stem_p = stem_k // 2
         self.stem = nn.Sequential(
-            nn.Conv1d(1, C, kernel_size=k, padding=p, padding_mode='circular'),
-            nn.GroupNorm(8, C) if norm=='group' else nn.BatchNorm1d(C),
+            nn.Conv1d(1, C, kernel_size=stem_k, padding=stem_p, padding_mode="circular"),
+            make_norm_1d(C, norm=norm),
             nn.GELU(),
-            nn.MaxPool1d(2) if stem_pool else nn.Identity(),  # 可选下采样
+            nn.MaxPool1d(2) if stem_pool else nn.Identity(),
         )
+        self.stem_pool = stem_pool
 
-        # ----- Residual Conv Blocks -----
-        # 通道保持不变，靠 dilation 扩感受野
-        blocks = []
+        # ----- Residual Conv Blocks with dilation schedule -----
         ds = list(dilation_schedule)
         if len(ds) < num_blocks:
-            # 不够就循环
-            ds = (ds * ((num_blocks + len(ds) - 1)//len(ds)))[:num_blocks]
-        for d in ds[:num_blocks]:
+            ds = (ds * ((num_blocks + len(ds) - 1) // len(ds)))[:num_blocks]
+        ds = ds[:num_blocks]
+        self._dilations_used = ds  # for inspection
+
+        blocks = []
+        for d in ds:
             blocks.append(
-                ResidualConvBlock(C, kernel_size=k, dilation=d,
-                                  dropout=dropout, use_se=use_se, norm=norm)
+                ResidualConvBlock(
+                    channels=C,
+                    k1=block_k1,
+                    k2=block_k2,
+                    dilation=int(d),
+                    dropout=dropout,
+                    use_se=use_se,
+                    norm=norm,
+                )
             )
         self.blocks = nn.Sequential(*blocks)
 
-        # ----- Global pooling + 线性投影 -----
+        # ----- Global pooling + projection -----
         self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.proj = nn.Linear(C, 128)    # 更大的全局表征
+        self.proj = nn.Linear(C, 128)
         self.proj_act = nn.GELU()
 
-        # ----- 条件向量处理（与原版一致） -----
+        # ----- Condition branch (road/turn) -----
         if use_embedding:
             self.emb_road = nn.Embedding(n_road, d_road)
             self.emb_turn = nn.Embedding(n_turn, d_turn)
-            cond_dim = d_road + d_turn
+            cond_in_dim = d_road + d_turn
         else:
-            cond_dim = 2
+            cond_in_dim = 2
 
         self.cond_mlp = nn.Sequential(
-            nn.Linear(cond_dim, 128),
+            nn.Linear(cond_in_dim, 128),
             nn.GELU(),
             nn.Linear(128, 128),
         )
+
+        # FiLM
         self.film_gamma = nn.Linear(128, 128)
         self.film_beta  = nn.Linear(128, 128)
-        self.gate = nn.Sequential(nn.Linear(128, 1), nn.Sigmoid())
 
-        # ----- 回归头：残差 MLP 堆叠 -----
+        if film_identity:
+            # start near identity: gamma ~ 1, beta ~ 0
+            nn.init.zeros_(self.film_gamma.weight)
+            nn.init.zeros_(self.film_gamma.bias)
+            nn.init.zeros_(self.film_beta.weight)
+            nn.init.zeros_(self.film_beta.bias)
+
+        # Radar-aware gate: input = [cond, lidar_feat]
+        self.gate = nn.Sequential(
+            nn.Linear(128 + 128, gate_hidden),
+            nn.GELU(),
+            nn.Dropout(gate_dropout),
+            nn.Linear(gate_hidden, 1),
+            nn.Sigmoid(),
+        )
+
+        # ----- Aux tail branch (optional) -----
+        if aux_tail > 0:
+            self.aux_dropout = nn.Dropout(p=aux_dropout_p)
+            self.aux_proj = nn.Sequential(
+                nn.Linear(aux_tail, 128),
+                nn.GELU(),
+                nn.Linear(128, 128),
+            )
+        else:
+            self.aux_dropout = None
+            self.aux_proj = None
+
+        # ----- Regression head -----
         self.head_pre = nn.Linear(128, 128)
         self.head_blocks = nn.Sequential(
             ResidualMLP(128, hidden=128, dropout=dropout),
@@ -164,39 +270,69 @@ class RegressionNetwork(nn.Module):
             nn.Linear(128, out_dim),
         )
 
-    def forward(self, x_lidar, road_type, turn_direction):
+    def forward(self, x_lidar: torch.Tensor, road_type: torch.Tensor, turn_direction: torch.Tensor) -> torch.Tensor:
+        # x_lidar: [B, L] or [B, 1, L]
         if x_lidar.dim() == 2:
-            x_lidar = x_lidar.unsqueeze(1)  # [B,1,L]
+            seq = x_lidar
+        elif x_lidar.dim() == 3:
+            seq = x_lidar.squeeze(1)
+        else:
+            raise ValueError("x_lidar must be [B,L] or [B,1,L]")
 
-        # Backbone
-        x = self.stem(x_lidar)               # [B,C,L']
-        x = self.blocks(x)                   # 深层残差
-        x = self.global_pool(x).squeeze(-1)  # [B,C]
-        x = self.proj_act(self.proj(x))      # [B,128]
-        lidar_feat = x
+        # split: first 360 are radar, last aux_tail are extra features (if present)
+        L = seq.size(-1)
+        aux_raw = None
+        if self.aux_tail > 0 and L >= 360 + self.aux_tail:
+            aux_raw = seq[:, -self.aux_tail:]   # [B, aux_tail]
+            seq = seq[:, :360]                  # [B, 360]
+        else:
+            seq = seq[:, :360] if L >= 360 else seq  # allow shorter, but your data should be 360
 
-        # 条件向量
+        # ---- Radar backbone ----
+        x = seq.unsqueeze(1)     # [B, 1, 360]
+        x = self.stem(x)         # [B, C, L'] (L' = 360 if no pool else 180)
+        if self.print_dilations and (not hasattr(self, "_printed_once")):
+            print("[Model] stem_pool:", self.stem_pool, "| dilations used:", self._dilations_used)
+            self._printed_once = True
+
+        x = self.blocks(x)                       # [B, C, L']
+        x = self.global_pool(x).squeeze(-1)      # [B, C]
+        lidar_feat = self.proj_act(self.proj(x)) # [B, 128]
+
+        # ---- Condition vector ----
         if self.use_embedding:
             road = road_type.long().view(-1)
             turn = turn_direction.long().view(-1)
-            cond_raw = torch.cat([self.emb_road(road), self.emb_turn(turn)], dim=1)
+            cond_raw = torch.cat([self.emb_road(road), self.emb_turn(turn)], dim=1)  # [B, d_road+d_turn]
         else:
             road = road_type.float().view(-1, 1)
             turn = turn_direction.float().view(-1, 1)
-            cond_raw = torch.cat([road, turn], dim=1)
-        cond = self.cond_mlp(cond_raw)       # [B,128]
+            cond_raw = torch.cat([road, turn], dim=1)                                 # [B, 2]
 
-        # FiLM + 门控
+        cond = self.cond_mlp(cond_raw)  # [B, 128]
+
+        # ---- FiLM + radar-aware gate ----
         gamma = self.film_gamma(cond)
         beta  = self.film_beta(cond)
-        mod = gamma * lidar_feat + beta
-        gate_w = self.gate(cond)             # [B,1]
-        fused = gate_w * mod + (1 - gate_w) * lidar_feat
+        if self.film_identity:
+            gamma = 1.0 + gamma
 
-        # 回归头（更深）
+        mod = gamma * lidar_feat + beta
+
+        gate_in = torch.cat([cond, lidar_feat], dim=1)  # radar-aware
+        gate_w = self.gate(gate_in)                     # [B, 1]
+        fused = gate_w * mod + (1.0 - gate_w) * lidar_feat
+
+        # ---- Aux tail correction ----
+        if (aux_raw is not None) and (self.aux_proj is not None):
+            aux = self.aux_dropout(aux_raw)     # train only; disabled in eval()
+            aux_feat = self.aux_proj(aux)       # [B, 128]
+            fused = fused + self.aux_scale * aux_feat
+
+        # ---- Regression head ----
         y = self.head_pre(fused)
         y = self.head_blocks(y)
-        out = self.head_out(y)               # [B,out_dim]
+        out = self.head_out(y)  # [B, out_dim]
         if out.shape[1] == 1:
             out = out.squeeze(1)
         return out
